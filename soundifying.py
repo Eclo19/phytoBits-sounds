@@ -228,25 +228,28 @@ def _osc_from_freq(f_hz, sr=SR, phase0=0.0):
 
 def pad(control, sr=SR, notes=PAD_NOTES):
     """
-    Stable warm pad (no long-term pitch drift):
-      - sine + soft-saw + sub
-      - fixed micro-detune per voice (constant)
-      - bounded vibrato LFO (forced zero-mean per render)
-      - phase accumulated in float64 + wrapped (prevents float32 drift)
-      - wetter reverb
+    More aggressive control modulation pad (still stable, no long-term pitch drift):
+      - control boosts peaks (gamma curve) -> bigger perceived movement
+      - much wider amp + cutoff modulation
+      - faster cutoff smoothing (more reactive)
+      - stronger vibrato modulation
+      - optional "edge" component that increases with control
     """
     N = len(control)
     t = (np.arange(N, dtype=np.float64) / float(sr))         # float64 time
     c = clamp01(control).astype(np.float64)
 
-    # --- musical params ---
-    base_amp = 0.16
-    amp = (base_amp + 0.10 * c).astype(np.float64)
+    # --- make control hit harder near peaks ---
+    c_hot = np.power(c, 0.55)  # gamma < 1 => emphasizes highs (aggressive)
 
-    base_cutoff = 600.0
-    cutoff = base_cutoff + 3200.0 * c
-    cutoff = smooth_signal(cutoff.astype(np.float32), cutoff_hz=2.0, sr=sr).astype(np.float64)
-    cutoff *= (0.92 + 0.08 * np.sin(2*np.pi*0.03*t))         # timbral motion only
+    # --- musical params (more aggressive) ---
+    base_amp = 0.10
+    amp = (base_amp + 0.55 * c_hot).astype(np.float64)       # big dynamic swing
+
+    base_cutoff = 350.0
+    cutoff = base_cutoff + 12000.0 * c_hot                   # huge sweep range
+    cutoff = smooth_signal(cutoff.astype(np.float32), cutoff_hz=5.0, sr=sr).astype(np.float64)
+    cutoff *= (0.85 + 0.15 * np.sin(2*np.pi*0.03*t))         # a bit more motion
 
     freqs = np.array([note_to_freq(n) for n in notes], dtype=np.float64)
 
@@ -254,8 +257,8 @@ def pad(control, sr=SR, notes=PAD_NOTES):
     dets = np.array([0.9992, 1.0000, 1.0008], dtype=np.float64)
 
     # Vibrato (bounded), then force EXACT zero-mean so it cannot bias pitch
-    vib_rate = 0.22 + 0.10 * c
-    vib_depth = 0.0008 + 0.0004 * c
+    vib_rate  = 0.18 + 0.35 * c_hot
+    vib_depth = 0.0006 + 0.0012 * c_hot
     vib_raw = vib_depth * np.sin(2*np.pi*vib_rate*t)
     vib = vib_raw - np.mean(vib_raw)                         # exact zero-mean over buffer
 
@@ -286,13 +289,20 @@ def pad(control, sr=SR, notes=PAD_NOTES):
     lfo = (0.84 + 0.16*np.sin(2*np.pi*0.07*t)).astype(np.float64)
     x *= amp * lfo
 
-    # filter + reverb + envelope + safety
+    # filter
     y = one_pole_lpf_varying(x.astype(np.float32), cutoff.astype(np.float32), sr).astype(np.float32)
+
+    # --- optional "edge / bite" that increases with control ---
+    edge = (y - one_pole_lpf(y, 900.0, sr)).astype(np.float32)
+    y = (y + (0.10 + 0.35 * c_hot.astype(np.float32)) * edge).astype(np.float32)
+
+    # reverb + envelope + safety
     y = _schroeder_reverb(y, sr=sr, wet=0.32)
     y *= adsr(N, a=0.03, d=0.12, s=0.95, r=0.35)
     y = np.tanh(y * 1.1).astype(np.float32)
 
     return y
+
 
 # ---------- Rhythm ---------- #
 
@@ -599,8 +609,146 @@ def lead_synth(
     return y
 
 # ============================================================
-# Plotting
+# Plotting (updated: raw control w/ timestamps + day/night shading)
 # ============================================================
+
+from datetime import datetime, timedelta
+from pytz import timezone
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+
+
+CHICAGO_TZ = timezone("America/Chicago")
+LIGHT_ON  = (10, 0)  # 10:00 AM
+LIGHT_OFF = (22, 0)  # 10:00 PM
+
+
+def _title_for_signal(which: int) -> str:
+    return "CAM Data" if int(which) == 1 else "C3-CAM"
+
+
+def _to_py_datetimes_chicago(ts_arr, tz=CHICAGO_TZ):
+    """
+    Convert timestamps array into a list of Python datetime objects in Chicago TZ.
+
+    Accepts:
+      - numpy datetime64 array (tz-naive by nature)
+      - Python datetime objects (naive or tz-aware)
+      - Anything that can be np.asarray(...) into a 1D array of datetimes
+
+    Behavior:
+      - If timestamps are tz-naive, assume they are already in Chicago local time
+        and localize them to CHICAGO_TZ.
+      - If tz-aware, convert to CHICAGO_TZ.
+    """
+    ts = np.asarray(ts_arr)
+
+    # numpy datetime64 -> python datetime (naive)
+    if np.issubdtype(ts.dtype, np.datetime64):
+        # Convert to microsecond resolution to avoid weird rounding
+        ts_us = ts.astype("datetime64[us]")
+        py = [d.astype(datetime) for d in ts_us]
+    else:
+        # Already python datetimes (or list-like)
+        py = list(ts)
+
+    out = []
+    for d in py:
+        if d is None:
+            continue
+        # If timezone-aware -> convert to Chicago
+        if getattr(d, "tzinfo", None) is not None:
+            out.append(d.astimezone(tz))
+        else:
+            # tz-naive -> assume Chicago local time, localize
+            out.append(tz.localize(d))
+    return out
+
+
+def _shade_day_night(ax, t_min, t_max, tz=CHICAGO_TZ, light_on=LIGHT_ON, light_off=LIGHT_OFF):
+    """
+    Shade nights: before 10AM and after 10PM, per day, between t_min and t_max.
+    t_min/t_max must be tz-aware datetimes in the same tz.
+    """
+    start_date = t_min.date()
+    end_date   = t_max.date()
+
+    current = start_date
+    while current <= end_date:
+        day_start = tz.localize(datetime.combine(current, datetime.min.time()))
+        on  = day_start + timedelta(hours=light_on[0],  minutes=light_on[1])
+        off = day_start + timedelta(hours=light_off[0], minutes=light_off[1])
+        day_end = day_start + timedelta(days=1)
+
+        # night: midnight -> 10AM
+        ax.axvspan(day_start, on, alpha=0.30, color="darkgrey", zorder=0)
+        # night: 10PM -> midnight
+        ax.axvspan(off, day_end, alpha=0.30, color="darkgrey", zorder=0)
+
+        current += timedelta(days=1)
+
+
+def save_control_plot_raw_with_timestamps(
+    control_raw: np.ndarray,
+    control_time: np.ndarray,
+    which: int,
+    out_dir: str = ".",
+    tz=CHICAGO_TZ,
+    light_on=LIGHT_ON,
+    light_off=LIGHT_OFF,
+):
+    """
+    RAW plot requirements:
+      1) Plot the raw data of the selected signal
+      2) Title: "CAM Data" if sig1, "C3-CAM" if sig2
+      3) X-axis uses timestamps that go with the raw data
+      4) Shade nighttimes (after 10PM and before 10AM Chicago time)
+    """
+    y = np.asarray(control_raw, dtype=np.float32).squeeze()
+    if y.ndim != 1:
+        raise ValueError(f"control_raw must be 1D; got shape {y.shape}")
+
+    t_list = _to_py_datetimes_chicago(control_time, tz=tz)
+    if len(t_list) != len(y):
+        raise ValueError(
+            f"control_time length ({len(t_list)}) must match control_raw length ({len(y)})."
+        )
+
+    title = _title_for_signal(which)
+
+    plt.figure(figsize=(12, 9))
+    ax = plt.gca()
+
+    # Shade nights first (behind data)
+    t_min, t_max = min(t_list), max(t_list)
+    _shade_day_night(ax, t_min, t_max, tz=tz, light_on=light_on, light_off=light_off)
+
+    # Plot raw signal
+    ax.plot(t_list, y, linewidth=1.0)
+
+    ax.set_title(title, fontsize=16, fontweight="bold")
+    ax.set_xlabel("Timestamp (Chicago)", fontsize=12)
+    ax.set_ylabel("CO₂ (ppm, raw)", fontsize=12)
+    ax.grid(True, alpha=0.30)
+
+    # Nice datetime formatting
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d, %I %p", tz=tz))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=-30, ha="left")
+
+    # Tight x-limits
+    ax.set_xlim(t_min, t_max)
+
+    plt.tight_layout()
+
+    png_name = f"control_sig{int(which)}_raw.png"
+    png_path = f"{out_dir.rstrip('/')}/{png_name}"
+    plt.savefig(png_path, dpi=220, bbox_inches="tight")
+    plt.close()
+    print(f"Saved control plot -> {png_path}")
+
+
+# Optional: keep plot_audio as-is (unchanged), included here for completeness.
 def plot_audio(x, sr):
     """
     Plot audio amplitude vs time (seconds).
@@ -617,27 +765,6 @@ def plot_audio(x, sr):
     plt.tight_layout()
     plt.show()
 
-def save_control_plot(control_raw: np.ndarray, sr: int, seconds: float, which: int, out_dir: str = "."):
-    """
-    Saves a PNG plot of the chosen raw control signal.
-    Filename is based on which control is selected (1 or 2).
-    """
-    control_raw = np.asarray(control_raw, dtype=np.float32).squeeze()
-    t = np.arange(len(control_raw), dtype=np.float32)  # sample index (raw points)
-
-    plt.figure(figsize=(12, 4))
-    plt.plot(t, control_raw)
-    plt.xlabel("Raw sample index")
-    plt.ylabel("CO₂ (raw)")
-    plt.title(f"Control signal {which} (raw)  |  target audio: {seconds:.2f}s @ {sr} Hz")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-
-    png_name = f"control_sig{which}_raw.png"
-    png_path = f"{out_dir.rstrip('/')}/{png_name}"
-    plt.savefig(png_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved control plot -> {png_path}")
 
 # ============================================================
 # WAV writer + render
@@ -686,7 +813,7 @@ def render_mix(control_signal, seconds=10, sr=SR, bpm=110, fade_out_ms=500.0):
     lead_x = lead_synth(control, bpm=bpm, sr=SR, melody_notes=LEAD_MELODY, change_every_beats=4)
 
     # Mix them together
-    mix = 0.9 * pad_x + 0.1 * drum_x + 0.9 * lead_x  # adjust as desired
+    mix = 0.98 * pad_x + 0.14 * drum_x + 0.95 * lead_x  # adjust as desired
     mix = mix.astype(np.float32)
 
     # --- end fade to prevent file-tail pop ---
@@ -705,24 +832,26 @@ def write_wave(control_signal, filename="output_sound.wav", seconds=12, sr=SR, b
 # ============================================================
 def load_control_signal(path: str) -> np.ndarray:
     """
-    Load a raw CO2 control signal from .npy OR .npz.
+    Load a raw CO2 control signal OR timestamps from .npy OR .npz.
 
-    - .npy: expects a single 1D array
-    - .npz: uses the only array if one exists, otherwise tries common keys
+    - If the stored array is datetime64, it is returned as-is (NO float casting).
+    - Otherwise, returns float32 1D array.
+
+    .npy: expects a single array
+    .npz: uses the only array if one exists, otherwise tries common keys
     """
     obj = np.load(path, allow_pickle=False)
 
     # .npy case -> ndarray
     if isinstance(obj, np.ndarray):
         x = obj
-
-    # .npz case -> NpzFile
     else:
+        # .npz case -> NpzFile
         data = obj
         if len(data.files) == 1:
             x = data[data.files[0]]
         else:
-            for k in ("co2", "CO2", "sig", "signal", "x", "y", "values", "co2_values"):
+            for k in ("time", "timestamp", "timestamps", "t", "co2", "CO2", "sig", "signal", "x", "y", "values"):
                 if k in data.files:
                     x = data[k]
                     break
@@ -731,8 +860,13 @@ def load_control_signal(path: str) -> np.ndarray:
 
     x = np.asarray(x).squeeze()
     if x.ndim != 1:
-        raise ValueError(f"Control signal must be 1D after squeeze; got shape {x.shape} from {path}")
+        raise ValueError(f"Loaded array must be 1D after squeeze; got shape {x.shape} from {path}")
 
+    # IMPORTANT: preserve datetime64 timestamps
+    if np.issubdtype(x.dtype, np.datetime64):
+        return x
+
+    # numeric control signal
     return x.astype(np.float32)
 
 
@@ -781,36 +915,45 @@ def _signal_to_time(raw_sig: np.ndarray, seconds: float, sr: int) -> np.ndarray:
     return out
 
 
-
 # ============================================================
-# Main
+# Main 
 # ============================================================
 if __name__ == "__main__":
 
+    # Choose which control to use: 1 or 2
+    CONTROL_SELECT = 1
+
     # --- Render config ---
-    OUT_WAV = "output_sig2.wav"
+    OUT_WAV = f"output_sig{CONTROL_SELECT}.wav"
     BPM = 120
     SECONDS = 20
     SR = 44100  # keep consistent with your global SR
 
-    # Control sigs
-    CO2_SIG1_FILE = "co2_sig1_raw.npy"
-    CO2_SIG2_FILE = "co2_sig2_raw.npy"
+    # Control sigs (raw + time)
+    CO2_SIG1_RAW  = "co2_sig1_raw.npy"
+    CO2_SIG1_TIME = "co2_sig1_time.npy"
+    CO2_SIG2_RAW  = "co2_sig2_raw.npy"
+    CO2_SIG2_TIME = "co2_sig2_time.npy"
 
-    # Choose which control to use: 1 or 2
-    CONTROL_SELECT = 2
-
-    # --- Choose which raw control file to use ---
-    control_file = CO2_SIG1_FILE if CONTROL_SELECT == 1 else CO2_SIG2_FILE
+    # --- Choose which raw control file + time file to use ---
+    raw_file  = CO2_SIG1_RAW  if CONTROL_SELECT == 1 else CO2_SIG2_RAW
+    time_file = CO2_SIG1_TIME if CONTROL_SELECT == 1 else CO2_SIG2_TIME
     which = CONTROL_SELECT
-    print(f"Using control file: {control_file}")
+    print(f"Using control files: raw={raw_file} | time={time_file}")
 
     # 1) Load raw CO2 samples (irregular / arbitrary length)
-    raw_control = load_control_signal(control_file)
+    raw_control = load_control_signal(raw_file)
+    raw_time    = load_control_signal(time_file)  # timestamps saved as numpy datetime64 in .npy
     print(f"Loaded raw control length: {len(raw_control)} samples")
+    print(f"Loaded raw time length:    {len(raw_time)} timestamps")
 
-    # --- Plot + save RAW control (no interpolation) ---
-    save_control_plot(raw_control, sr=SR, seconds=SECONDS, which=which, out_dir=".")
+    # --- Plot + save RAW control (with timestamps + day/night shading) ---
+    """save_control_plot_raw_with_timestamps(
+        control_raw=raw_control,
+        control_time=raw_time,
+        which=which,
+        out_dir=".",
+    )"""
 
     # 2) Convert raw control into per-audio-sample control (step/zero-hold)
     control = _signal_to_time(raw_control, seconds=SECONDS, sr=SR)
